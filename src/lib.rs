@@ -1,42 +1,40 @@
-use std::ops::Range;
+use itertools::Itertools;
+use std::{cmp::Ordering, collections::BTreeMap, ops::Range};
 
-// -INFINITE_PENALTY is ok, as -i32::MAX is still in the range of an i32
-pub const INFINITE_PENALTY: i32 = i32::MAX;
-pub const INFINITE_STRETCHABILITY: i32 = i32::MAX;
+pub type Value = fixed::types::I32F32;
+
+/// For negative, better use NEG_INFINITE_PENALTY
+pub const INFINITE_PENALTY: Value = Value::MAX;
+pub const NEG_INFINITE_PENALTY: Value = INFINITE_PENALTY.saturating_neg();
+
+// TODO: Allow adjusting this. Also, this should probably be scaled by the units in use.
+const CONSECUTIVE_FLAG_PENALTY: u16 = 3_000;
 
 #[derive(Clone, Debug)]
 pub struct Glue {
-    pub width: i32,
-    pub shrinkability: i32,
-    pub stretchability: i32,
+    pub width: Value,
+    pub shrinkability: Value,
+    pub stretchability: Value,
 }
 
 impl Glue {
-    pub fn new(width: i32, shrinkability: i32, stretchability: i32) -> Self {
+    pub fn new(width: Value, shrinkability: Value, stretchability: Value) -> Self {
         Self {
             width,
             shrinkability,
             stretchability,
         }
     }
-
-    pub fn new_infinite(min_width: i32) -> Self {
-        Self {
-            width: min_width,
-            shrinkability: 0,
-            stretchability: INFINITE_STRETCHABILITY,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct BoxItem<T> {
-    pub width: i32,
+    pub width: Value,
     pub user_data: T,
 }
 
 impl<T> BoxItem<T> {
-    pub fn new(width: i32, user_data: T) -> Self {
+    pub fn new(width: Value, user_data: T) -> Self {
         Self { width, user_data }
     }
 
@@ -53,8 +51,8 @@ impl<T> BoxItem<T> {
 
 #[derive(Clone, Debug)]
 pub struct Penalty<T> {
-    pub width: i32,
-    pub value: i32,
+    pub width: Value,
+    pub value: Value,
     /// Called a "flagged" penalty by the Knuth-Plass paper when true
     pub gets_extra_penalty_for_consecutive_lines: bool,
     pub user_data: T,
@@ -62,8 +60,8 @@ pub struct Penalty<T> {
 
 impl<T> Penalty<T> {
     pub fn new(
-        width: i32,
-        value: i32,
+        width: Value,
+        value: Value,
         gets_extra_penalty_for_consecutive_lines: bool,
         user_data: T,
     ) -> Self {
@@ -77,7 +75,7 @@ impl<T> Penalty<T> {
 
     pub fn new_forbid_break(user_data: T) -> Self {
         Self {
-            width: 0,
+            width: 0.into(),
             value: INFINITE_PENALTY,
             gets_extra_penalty_for_consecutive_lines: false,
             user_data,
@@ -86,8 +84,8 @@ impl<T> Penalty<T> {
 
     pub fn new_forced_break(user_data: T) -> Self {
         Self {
-            width: 0,
-            value: -INFINITE_PENALTY,
+            width: 0.into(),
+            value: NEG_INFINITE_PENALTY,
             gets_extra_penalty_for_consecutive_lines: false,
             user_data,
         }
@@ -98,7 +96,7 @@ impl<T> Penalty<T> {
     }
 
     pub fn is_forced_break(&self) -> bool {
-        self.value <= -INFINITE_PENALTY
+        self.value <= NEG_INFINITE_PENALTY
     }
 
     /// Applies a transformation to the user data
@@ -127,21 +125,17 @@ pub enum LineItem<T> {
 }
 
 impl<T> LineItem<T> {
-    pub fn new_glue(width: i32, shrinkability: i32, stretchability: i32) -> Self {
+    pub fn new_glue(width: Value, shrinkability: Value, stretchability: Value) -> Self {
         LineItem::Glue(Glue::new(width, shrinkability, stretchability))
     }
 
-    pub fn new_infinite_glue(min_width: i32) -> Self {
-        LineItem::Glue(Glue::new_infinite(min_width))
-    }
-
-    pub fn new_box_item(width: i32, user_data: T) -> Self {
+    pub fn new_box_item(width: Value, user_data: T) -> Self {
         LineItem::BoxItem(BoxItem::new(width, user_data))
     }
 
     pub fn new_penalty(
-        width: i32,
-        value: i32,
+        width: Value,
+        value: Value,
         gets_extra_penalty_for_consecutive_lines: bool,
         user_data: T,
     ) -> Self {
@@ -185,6 +179,14 @@ impl<T> LineItem<T> {
         }
     }
 
+    pub fn user_data(&self) -> Option<&T> {
+        match self {
+            LineItem::Glue(_) => None,
+            LineItem::BoxItem(box_item) => Some(&box_item.user_data),
+            LineItem::Penalty(penalty) => Some(&penalty.user_data),
+        }
+    }
+
     /// Applies a transformation to any user data
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> LineItem<U> {
         match self {
@@ -195,6 +197,283 @@ impl<T> LineItem<T> {
     }
 }
 
-pub fn break_lines<T>(desired_width: u32, line_items: &[LineItem<T>]) -> Vec<Range<usize>> {
-    todo!()
+fn saturating_sum(items: impl IntoIterator<Item = Value>) -> Value {
+    items.into_iter().fold(0.into(), |a, b| a.saturating_add(b))
+}
+
+fn square(x: Value) -> Value {
+    x.saturating_mul(x)
+}
+
+fn cube(x: Value) -> Value {
+    square(x).saturating_mul(x)
+}
+
+/// Get indices without leading penalties and glues
+fn trim_line<T>(line_items: &[LineItem<T>]) -> Range<usize> {
+    if let Some(first_box) = line_items.iter().position(|item| item.box_item().is_some()) {
+        debug_assert!(line_items.last().map_or(true, |item| item.glue().is_none()));
+        return first_box..line_items.len();
+    }
+
+    // Empty range
+    0..0
+}
+
+/// Returns None if the adjustment ratio is undefined
+fn calc_adjustment_ratio<T>(
+    desired_width: Value,
+    line_items: &[LineItem<T>],
+    next_item: &LineItem<T>,
+) -> Option<Value> {
+    let trailing_penalty = next_item.penalty();
+
+    let line_items = &line_items[trim_line(line_items)];
+    if line_items.is_empty() {
+        return None;
+    }
+
+    let mut total_width = saturating_sum(line_items.iter().map(|item| match item {
+        LineItem::BoxItem(b) => b.width,
+        LineItem::Glue(g) => g.width,
+        LineItem::Penalty(_) => 0.into(),
+    }));
+
+    if let Some(p) = trailing_penalty {
+        total_width = total_width.saturating_add(p.width);
+    }
+
+    let diff = desired_width.saturating_sub(total_width);
+
+    match diff.cmp(&0.into()) {
+        // desired_width == total_width
+        Ordering::Equal => Some(0.into()),
+
+        // desired_width > total_width, need to stretch
+        Ordering::Greater => {
+            let total_stretchability = saturating_sum(
+                line_items
+                    .iter()
+                    .filter_map(|item| item.glue())
+                    .map(|g| g.stretchability),
+            );
+
+            if total_stretchability > 0 {
+                Some(diff / total_stretchability)
+            } else {
+                None
+            }
+        }
+
+        // desired_width < total_width, need to shrink
+        Ordering::Less => {
+            let total_shrinkability = saturating_sum(
+                line_items
+                    .iter()
+                    .filter_map(|item| item.glue())
+                    .map(|g| g.shrinkability),
+            );
+
+            if total_shrinkability > 0 {
+                Some(diff / total_shrinkability)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// adj_ratio should be defined and >= -1
+fn calc_line_badness(adj_ratio: Value) -> Value {
+    debug_assert!(adj_ratio >= -1);
+
+    // TODO: This should probably be scaled by the units in use.
+    Value::from(100).saturating_mul(cube(adj_ratio))
+}
+
+fn calc_line_demerits<T>(
+    adj_ratio: Value,
+    next_item: &LineItem<T>,
+    last_line_had_flagged_penalty: bool,
+) -> Value {
+    let trailing_penalty = next_item.penalty();
+
+    let alpha = if last_line_had_flagged_penalty
+        && trailing_penalty.map(|p| p.gets_extra_penalty_for_consecutive_lines) == Some(true)
+    {
+        Value::from(CONSECUTIVE_FLAG_PENALTY)
+    } else {
+        0.into()
+    };
+
+    let penalty_value = Value::from(trailing_penalty.map(|p| p.value).unwrap_or(0.into()));
+    let badness = calc_line_badness(adj_ratio);
+
+    if penalty_value >= 0 {
+        square(
+            Value::from(1)
+                .saturating_add(badness)
+                .saturating_add(penalty_value),
+        )
+        .saturating_add(alpha)
+    } else if -INFINITE_PENALTY < penalty_value {
+        square(Value::from(1).saturating_add(badness))
+            .saturating_sub(penalty_value)
+            .saturating_add(alpha)
+    } else {
+        square(Value::from(1).saturating_add(badness)).saturating_add(alpha)
+    }
+}
+
+#[derive(Debug)]
+struct BreakpointInfo {
+    previous_breakpoint: usize,
+    adj_ratio_for_last_line: Value,
+    demerits_from_start_of_paragraph: Value,
+}
+
+fn is_legal_breakpoint<T>(prev_item: &LineItem<T>, this_item: &LineItem<T>) -> bool {
+    match (prev_item, this_item) {
+        (_, LineItem::Penalty(p)) => p.value < INFINITE_PENALTY,
+        (LineItem::BoxItem(_), LineItem::Glue(_)) => true,
+        _ => false,
+    }
+}
+
+pub struct Line {
+    pub range: Range<usize>,
+    pub adj_ratio: Value,
+}
+
+fn break_lines_with_tolerance<T>(
+    desired_width: Value,
+    line_items: &[LineItem<T>],
+    tolerance: Value,
+) -> Option<Vec<Line>> {
+    assert!(!line_items.is_empty());
+
+    let mut breakpoint_infos: BTreeMap<usize, BreakpointInfo> = BTreeMap::new();
+    // previous won't actually be used
+    breakpoint_infos.insert(
+        0,
+        BreakpointInfo {
+            previous_breakpoint: 0,
+            adj_ratio_for_last_line: 0.into(),
+            demerits_from_start_of_paragraph: 0.into(),
+        },
+    );
+
+    let mut active_breakpoints = vec![0];
+
+    // TODO: force break after line_items
+    for (prev_i, (prev_item, cur_item)) in line_items.iter().tuple_windows().enumerate() {
+        if !is_legal_breakpoint(prev_item, cur_item) {
+            continue;
+        }
+
+        let i = prev_i + 1;
+
+        let is_forced = cur_item
+            .penalty()
+            .map(|p| p.is_forced_break())
+            .unwrap_or(false);
+
+        struct ScoredActiveBreakpoint {
+            index: usize,
+            adj_ratio: Value,
+            demerits: Value,
+        }
+
+        let scored = active_breakpoints.iter().copied().filter_map(|a| {
+            let a_info = &breakpoint_infos[&a];
+
+            if let Some(adj_ratio) =
+                calc_adjustment_ratio(desired_width, &line_items[a..i], cur_item)
+            {
+                if !(-1 <= adj_ratio && adj_ratio <= tolerance) {
+                    return None;
+                }
+
+                // TODO: flag from previous line
+                let line_demerits = calc_line_demerits(adj_ratio, cur_item, false);
+                let total_demerits = a_info
+                    .demerits_from_start_of_paragraph
+                    .saturating_add(line_demerits);
+
+                Some(ScoredActiveBreakpoint {
+                    index: a,
+                    adj_ratio,
+                    demerits: total_demerits,
+                })
+            } else {
+                None
+            }
+        });
+
+        if let Some(best) = scored.min_by_key(|a| a.demerits) {
+            breakpoint_infos.insert(
+                i,
+                BreakpointInfo {
+                    previous_breakpoint: best.index,
+                    adj_ratio_for_last_line: best.adj_ratio,
+                    demerits_from_start_of_paragraph: if is_forced {
+                        // New paragraph
+                        0.into()
+                    } else {
+                        best.demerits
+                    },
+                },
+            );
+
+            if is_forced {
+                active_breakpoints.clear();
+            }
+
+            active_breakpoints.push(i);
+        } else if is_forced {
+            return None;
+        }
+    }
+
+    let mut final_indices = vec![];
+    // Already checked that line_items isn't empty
+    let mut index = line_items.len() - 1;
+    while index > 0 {
+        final_indices.push(index);
+
+        index = breakpoint_infos[&index].previous_breakpoint;
+    }
+    final_indices.push(0);
+
+    // Now get line indices
+    Some(
+        final_indices
+            .into_iter()
+            .rev()
+            .tuple_windows()
+            .map(|(a, b)| {
+                // TODO: include trailing penalty in returned line
+                let mut range = trim_line(&line_items[a..b]);
+                // trim_line result was relative to a
+                range.start += a;
+                range.end += a;
+
+                let adj_ratio = breakpoint_infos[&b].adj_ratio_for_last_line;
+
+                Line { range, adj_ratio }
+            })
+            .collect(),
+    )
+}
+
+pub fn break_lines<T>(desired_width: Value, line_items: &[LineItem<T>]) -> Vec<Line> {
+    for tolerance in 1..10 {
+        if let Some(result) =
+            break_lines_with_tolerance(desired_width, line_items, tolerance.into())
+        {
+            return result;
+        }
+    }
+
+    panic!("failed to break lines with tolerance <= 10");
 }
