@@ -10,6 +10,8 @@ pub const NEG_INFINITE_PENALTY: Value = INFINITE_PENALTY.saturating_neg();
 // TODO: Allow adjusting this. Also, this should probably be scaled by the units in use.
 const CONSECUTIVE_FLAG_PENALTY: u16 = 3_000;
 
+const MAX_TOLERANCE: u8 = 10;
+
 #[derive(Clone, Debug)]
 pub struct Glue {
     pub width: Value,
@@ -527,7 +529,7 @@ fn break_lines_with_tolerance<T>(
 }
 
 pub fn break_lines<T>(desired_width: Value, line_items: &[LineItem<T>]) -> Vec<Line> {
-    for tolerance in 1..10 {
+    for tolerance in 1..=MAX_TOLERANCE {
         if let Some(result) =
             break_lines_with_tolerance(desired_width, line_items, tolerance.into())
         {
@@ -535,5 +537,5 @@ pub fn break_lines<T>(desired_width: Value, line_items: &[LineItem<T>]) -> Vec<L
         }
     }
 
-    panic!("failed to break lines with tolerance <= 10");
+    panic!("Failed to break lines with tolerance <= {}", MAX_TOLERANCE);
 }
