@@ -431,7 +431,6 @@ fn break_lines_with_tolerance<T>(
 
     let mut active_breakpoints = vec![0];
 
-    // TODO: force break after line_items
     for (prev_i, (prev_item, cur_item)) in line_items.iter().tuple_windows().enumerate() {
         if !is_legal_breakpoint(prev_item, cur_item) {
             continue;
@@ -528,7 +527,17 @@ fn break_lines_with_tolerance<T>(
     )
 }
 
+/// `line_items` must end with a forced penalty item
 pub fn break_lines<T>(desired_width: Value, line_items: &[LineItem<T>]) -> Vec<Line> {
+    assert!(
+        line_items
+            .last()
+            .and_then(|item| item.penalty())
+            .map(|p| p.is_forced_break())
+            .unwrap_or(false),
+        "Last item must be a forced penalty (and wasn't)"
+    );
+
     for tolerance in 1..=MAX_TOLERANCE {
         if let Some(result) =
             break_lines_with_tolerance(desired_width, line_items, tolerance.into())
