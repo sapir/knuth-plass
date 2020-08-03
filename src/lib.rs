@@ -197,10 +197,6 @@ impl<T> LineItem<T> {
     }
 }
 
-fn saturating_sum(items: impl IntoIterator<Item = Value>) -> Value {
-    items.into_iter().fold(0.into(), |a, b| a.saturating_add(b))
-}
-
 fn square(x: Value) -> Value {
     x.saturating_mul(x)
 }
@@ -210,35 +206,115 @@ fn cube(x: Value) -> Value {
 }
 
 /// Get indices without leading penalties and glues
-fn trim_line<T>(line_items: &[LineItem<T>]) -> Range<usize> {
+fn trim_line<T>(line_items: &[LineItem<T>], range: Range<usize>) -> Range<usize> {
+    let line_items = &line_items[range.clone()];
+
     if let Some(first_box) = line_items.iter().position(|item| item.box_item().is_some()) {
         debug_assert!(line_items.last().map_or(true, |item| item.glue().is_none()));
-        return first_box..line_items.len();
+
+        let mut trimmed = first_box..line_items.len();
+
+        // Need to shift by range.start because we used a subset of the original line_items.
+        trimmed.start += range.start;
+        trimmed.end += range.start;
+
+        return trimmed;
     }
 
     // Empty range
     0..0
 }
 
+#[derive(Clone, Debug)]
+struct TotalledValues {
+    pub width: Value,
+    pub shrinkability: Value,
+    pub stretchability: Value,
+}
+
+/// Precalculated totals values for an array of LineItems, so that the total of each subarray
+/// can be calculated quickly, as described in the paper in the "The Algorithm Itself" section.
+#[derive(Debug)]
+struct Totals(Vec<TotalledValues>);
+
+impl Totals {
+    fn new<T>(line_items: &[LineItem<T>]) -> Self {
+        let initial = TotalledValues {
+            width: 0.into(),
+            shrinkability: 0.into(),
+            stretchability: 0.into(),
+        };
+
+        let values = line_items
+            .iter()
+            .scan(initial, |total, item| {
+                let total_before_item = total.clone();
+
+                total.width = total
+                    .width
+                    .checked_add(match item {
+                        LineItem::BoxItem(b) => b.width,
+                        LineItem::Glue(g) => g.width,
+                        LineItem::Penalty(_) => 0.into(),
+                    })
+                    .unwrap();
+
+                if let LineItem::Glue(g) = item {
+                    total.shrinkability = total.shrinkability.checked_add(g.shrinkability).unwrap();
+                    total.stretchability =
+                        total.stretchability.checked_add(g.stretchability).unwrap();
+                }
+
+                Some(total_before_item)
+            })
+            .collect();
+
+        Self(values)
+    }
+
+    /// Get total values for items in range. The given range must *not* include the last LineItem.
+    fn get(&self, range: Range<usize>) -> TotalledValues {
+        let first = &self.0[range.start];
+        // Totals are precalculated *before* each item, so to include the last item in the range
+        // in our total, we need to get the precalculated totals before the *next* item. `range`
+        // was an exclusive range, so the next item is at `range.end`.
+        let after_last = &self.0[range.end];
+
+        TotalledValues {
+            width: after_last.width.checked_sub(first.width).unwrap(),
+            shrinkability: after_last
+                .shrinkability
+                .checked_sub(first.shrinkability)
+                .unwrap(),
+            stretchability: after_last
+                .stretchability
+                .checked_sub(first.stretchability)
+                .unwrap(),
+        }
+    }
+}
+
 /// Returns None if the adjustment ratio is undefined
 fn calc_adjustment_ratio<T>(
     desired_width: Value,
     line_items: &[LineItem<T>],
+    totals: &Totals,
+    range: Range<usize>,
     next_item: &LineItem<T>,
 ) -> Option<Value> {
     let trailing_penalty = next_item.penalty();
 
-    let line_items = &line_items[trim_line(line_items)];
+    let trimmed_range = trim_line(line_items, range);
+    let line_items = &line_items[trimmed_range.clone()];
     if line_items.is_empty() {
         return None;
     }
 
-    let mut total_width = saturating_sum(line_items.iter().map(|item| match item {
-        LineItem::BoxItem(b) => b.width,
-        LineItem::Glue(g) => g.width,
-        LineItem::Penalty(_) => 0.into(),
-    }));
+    // `get()` requires that `trimmed_range` not include the last item in line_items, but we never
+    // will, because this function is always called with a `next_item`.
+    let totals = totals.get(trimmed_range);
 
+    let mut total_width = totals.width;
     if let Some(p) = trailing_penalty {
         total_width = total_width.saturating_add(p.width);
     }
@@ -251,15 +327,8 @@ fn calc_adjustment_ratio<T>(
 
         // desired_width > total_width, need to stretch
         Ordering::Greater => {
-            let total_stretchability = saturating_sum(
-                line_items
-                    .iter()
-                    .filter_map(|item| item.glue())
-                    .map(|g| g.stretchability),
-            );
-
-            if total_stretchability > 0 {
-                Some(diff / total_stretchability)
+            if totals.stretchability > 0 {
+                Some(diff / totals.stretchability)
             } else {
                 None
             }
@@ -267,15 +336,8 @@ fn calc_adjustment_ratio<T>(
 
         // desired_width < total_width, need to shrink
         Ordering::Less => {
-            let total_shrinkability = saturating_sum(
-                line_items
-                    .iter()
-                    .filter_map(|item| item.glue())
-                    .map(|g| g.shrinkability),
-            );
-
-            if total_shrinkability > 0 {
-                Some(diff / total_shrinkability)
+            if totals.shrinkability > 0 {
+                Some(diff / totals.shrinkability)
             } else {
                 None
             }
@@ -352,6 +414,8 @@ fn break_lines_with_tolerance<T>(
 ) -> Option<Vec<Line>> {
     assert!(!line_items.is_empty());
 
+    let totals = Totals::new(line_items);
+
     let mut breakpoint_infos: BTreeMap<usize, BreakpointInfo> = BTreeMap::new();
     // previous won't actually be used
     breakpoint_infos.insert(
@@ -388,7 +452,7 @@ fn break_lines_with_tolerance<T>(
             let a_info = &breakpoint_infos[&a];
 
             if let Some(adj_ratio) =
-                calc_adjustment_ratio(desired_width, &line_items[a..i], cur_item)
+                calc_adjustment_ratio(desired_width, &line_items, &totals, a..i, cur_item)
             {
                 if !(-1 <= adj_ratio && adj_ratio <= tolerance) {
                     return None;
@@ -453,11 +517,7 @@ fn break_lines_with_tolerance<T>(
             .tuple_windows()
             .map(|(a, b)| {
                 // TODO: include trailing penalty in returned line
-                let mut range = trim_line(&line_items[a..b]);
-                // trim_line result was relative to a
-                range.start += a;
-                range.end += a;
-
+                let range = trim_line(line_items, a..b);
                 let adj_ratio = breakpoint_infos[&b].adj_ratio_for_last_line;
 
                 Line { range, adj_ratio }
